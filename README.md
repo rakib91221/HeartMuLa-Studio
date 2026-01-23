@@ -224,6 +224,20 @@ volumes:
   - /path/to/comfyui/models/heartmula:/app/backend/models
 ```
 
+### Using Ollama with Docker
+
+To use Ollama (running on host) for AI lyrics generation:
+
+1. **Ollama is auto-configured** - The container uses `host.docker.internal` to reach Ollama on your host machine
+2. **Just run Ollama normally** on your host (not in Docker)
+3. The container will automatically connect to `http://host.docker.internal:11434`
+
+**Custom Ollama URL:**
+```yaml
+environment:
+  - OLLAMA_HOST=http://your-ollama-server:11434
+```
+
 ## Prerequisites
 
 - **Python** 3.10 or higher

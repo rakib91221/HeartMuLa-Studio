@@ -32,7 +32,8 @@ SUPPORTED_LANGUAGES = [
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 class LLMService:
-    OLLAMA_BASE_URL = "http://localhost:11434"
+    # Ollama URL - configurable for Docker (use host.docker.internal to reach host)
+    OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
     @staticmethod

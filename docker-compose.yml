@@ -20,6 +20,10 @@ services:
     ports:
       - "8000:8000"
 
+    # Allow container to reach host services (Ollama)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     volumes:
       # Persist models (auto-downloaded on first run, ~5GB)
       - ./backend/models:/app/backend/models
@@ -40,6 +44,8 @@ services:
       - HF_HOME=/app/backend/models
       # Database location (for Docker)
       - HEARTMULA_DB_PATH=/app/backend/db/jobs.db
+      # Ollama on host machine (for AI lyrics generation)
+      - OLLAMA_HOST=http://host.docker.internal:11434
 
     restart: unless-stopped
 
