@@ -118,13 +118,92 @@ Models are automatically downloaded from HuggingFace Hub on first run (~5GB):
 - HeartCodec (audio decoder)
 - Tokenizer and generation config
 
+## Quick Start
+
+```bash
+./start.sh
+```
+
+That's it! The system auto-detects your GPU and downloads models on first run.
+
+Open http://localhost:5173
+
+## Docker (Recommended)
+
+The easiest way to run HeartMuLa Studio - no Python/Node setup required.
+
+### Prerequisites
+- Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- NVIDIA GPU with 10GB+ VRAM
+
+### Quick Start with Docker
+
+```bash
+# Clone and start
+git clone https://github.com/fspecii/HeartMuLa-Studio.git
+cd HeartMuLa-Studio
+docker compose up -d
+
+# View logs (watch model download progress on first run)
+docker compose logs -f
+```
+
+Open **http://localhost:8000**
+
+### What Happens on First Run
+
+1. Docker builds the image (~10GB, includes CUDA + PyTorch)
+2. Models are automatically downloaded from HuggingFace (~5GB)
+3. Container starts with GPU auto-detection
+4. Frontend + API served on port 8000
+
+### Persistent Data
+
+All your data is preserved across container restarts:
+
+| Data | Location | Description |
+|------|----------|-------------|
+| **Generated Music** | `./backend/generated_audio/` | Your MP3 files (accessible from host) |
+| **Models** | `./backend/models/` | Downloaded AI models (~5GB) |
+| **Reference Audio** | `./backend/ref_audio/` | Uploaded style references |
+| **Song History** | Docker volume `heartmula-db` | Database with all your generations |
+
+### Docker Commands
+
+```bash
+# Start
+docker compose up -d
+
+# Stop
+docker compose down
+
+# View logs
+docker compose logs -f
+
+# Rebuild after updates
+docker compose build --no-cache
+docker compose up -d
+
+# Reset database (fresh start)
+docker compose down -v
+docker compose up -d
+```
+
+### Docker Configuration
+
+Override settings in `docker-compose.yml`:
+
+```yaml
+environment:
+  - HEARTMULA_4BIT=true                  # Force 4-bit quantization
+  - HEARTMULA_SEQUENTIAL_OFFLOAD=true    # Force model swapping (low VRAM)
+```
+
 ## Prerequisites
 
 - **Python** 3.10 or higher
 - **Node.js** 18 or higher
-- **CUDA GPU(s)**:
-  - **With 4-bit quantization**: 6GB+ VRAM (e.g., RTX 3060, RTX 4060)
-  - **Without quantization**: 12GB+ per GPU or 24GB single GPU
+- **CUDA GPU** with 10GB+ VRAM
 - **Git** for cloning the repository
 
 ## Installation
@@ -214,35 +293,50 @@ OLLAMA_HOST=http://localhost:11434
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HEARTMULA_4BIT` | `false` | Enable 4-bit quantization (~3GB VRAM instead of ~11GB) |
+| `HEARTMULA_4BIT` | `auto` | 4-bit quantization: `auto`, `true`, or `false` |
+| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto` | Model swapping for low VRAM: `auto`, `true`, or `false` |
 | `HEARTMULA_VERSION` | `RL-3B-20260123` | Model version (latest RL-tuned model) |
 | `CUDA_VISIBLE_DEVICES` | all GPUs | Specify which GPUs to use (e.g., `0,1`) |
 
-### GPU Configuration
+### GPU Auto-Configuration
 
-HeartMuLa Studio automatically detects available GPUs and distributes the model:
+HeartMuLa Studio **automatically detects** your GPU VRAM and selects the optimal configuration:
 
-| Setup | VRAM Required | Configuration |
-|-------|---------------|---------------|
-| **4-bit Quantization (Recommended)** | 6GB+ | ~3GB VRAM, runs on most modern GPUs |
-| **Multi-GPU** | 12GB + 12GB | HeartMuLa on GPU 0, HeartCodec on GPU 1 |
-| **Single GPU (High VRAM)** | 24GB+ | Both models on same GPU |
-| **Single GPU (Low VRAM)** | 16GB | Lazy loading - codec on CPU |
+| Your VRAM | Auto-Selected Mode | Speed | Example GPUs |
+|-----------|-------------------|-------|--------------|
+| **20GB+** | Full Precision | ~7 fps | RTX 4090, RTX 3090 Ti, A6000 |
+| **14-20GB** | 4-bit Quantized | ~7 fps | RTX 4060 Ti 16GB, RTX 3090 |
+| **10-14GB** | 4-bit + Model Swap | ~4 fps (+70s/song) | RTX 3060 12GB, RTX 4060 8GB |
+| **<10GB** | Not supported | - | Insufficient VRAM |
 
-**Recommended Setup (4-bit Quantization):**
+**Multi-GPU:** Automatically detected and used. HeartMuLa goes to fastest GPU (Flash Attention), HeartCodec to largest VRAM GPU.
+
+### Start Options
+
 ```bash
+./start.sh                # Auto-detect (recommended)
+./start.sh --force-4bit   # Force 4-bit quantization
+./start.sh --force-swap   # Force model swapping (low VRAM mode)
+./start.sh --help         # Show all options
+```
+
+### Manual Configuration (Advanced)
+
+Override auto-detection with environment variables:
+
+```bash
+# Force specific settings
+HEARTMULA_4BIT=true HEARTMULA_SEQUENTIAL_OFFLOAD=false ./start.sh
+
+# Or run directly
 HEARTMULA_4BIT=true python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
-**Multi-GPU Setup:**
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-```
-
-**Combined (4-bit + Multi-GPU):**
-```bash
-HEARTMULA_4BIT=true CUDA_VISIBLE_DEVICES=0,1 python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-```
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `HEARTMULA_4BIT` | `auto`, `true`, `false` | 4-bit quantization (default: auto) |
+| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto`, `true`, `false` | Model swapping for low VRAM (default: auto) |
+| `CUDA_VISIBLE_DEVICES` | `0`, `0,1`, etc. | Select specific GPUs |
 
 **Memory Optimization:**
 ```bash
@@ -313,11 +407,23 @@ HeartMuLa-Studio/
 
 | Issue | Solution |
 |-------|----------|
-| CUDA out of memory | Use multi-GPU setup with `CUDA_VISIBLE_DEVICES=0,1` or reduce duration |
-| Models not downloading | Check internet connection and disk space (~5GB needed) |
+| CUDA out of memory | System should auto-detect. Try `./start.sh --force-swap` or reduce duration |
+| Models not downloading | Check internet connection and disk space (~5GB needed in `backend/models/`) |
 | Frontend can't connect | Ensure backend is running on port 8000 |
 | LLM not working | Check Ollama is running or OpenRouter API key is set in `backend/.env` |
 | Only one GPU detected | Set `CUDA_VISIBLE_DEVICES=0,1` explicitly when starting backend |
+| Slow generation | Check logs: `tail -f /tmp/heartmula_backend.log` for GPU config |
+
+### Models Location
+
+Models are auto-downloaded to `backend/models/` (~5GB total):
+```
+backend/models/
+├── HeartMuLa-oss-RL-3B-20260123/   # Main model
+├── HeartCodec-oss/                  # Audio codec
+├── tokenizer.json
+└── gen_config.json
+```
 
 ## Credits
 

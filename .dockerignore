@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Node
+frontend/node_modules/
+frontend/.npm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated files (will be mounted as volumes)
+backend/generated/
+backend/uploads/
+backend/jobs.db
+backend/jobs.db.bak
+
+# Models (will be mounted as volume or downloaded at runtime)
+backend/models/
+
+# Large files
+*.gif
+*.mp4
+*.wav
+*.mp3
+*.flac
+
+# Documentation
+*.md
+!frontend/README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+frontend/dist/
+
+# HeartMuLa local dev
+HeartMuLa/

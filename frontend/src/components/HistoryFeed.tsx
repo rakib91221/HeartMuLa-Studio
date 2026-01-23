@@ -259,13 +259,13 @@ export const HistoryFeed: React.FC<HistoryFeedProps> = ({ history, currentJobId,
                                         onPlayTrack?.(job);
                                     }
                                 }}
-                                className={`absolute inset-0 flex items-center justify-center rounded-md transition-all duration-200 ${
+                                className={`absolute inset-0 flex items-center justify-center rounded-md transition-opacity duration-200 ${
                                     playingTrackId === job.id && isTrackPlaying
                                         ? 'bg-black/40'
                                         : 'bg-black/0 hover:bg-black/40 opacity-0 group-hover/cover:opacity-100'
                                 }`}
                             >
-                                <div className={`w-8 h-8 rounded-full flex items-center justify-center shadow-lg transition-transform hover:scale-110 ${
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center shadow-lg ${
                                     darkMode ? 'bg-[#1DB954] text-black' : 'bg-white text-slate-900'
                                 }`}>
                                     {playingTrackId === job.id && isTrackPlaying ? (

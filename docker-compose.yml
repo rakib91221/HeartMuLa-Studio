@@ -1,0 +1,53 @@
+services:
+  heartmula:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: heartmula-studio:latest
+    container_name: heartmula-studio
+
+    # GPU access - requires NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use all available GPUs
+              capabilities: [gpu]
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Persist models (auto-downloaded on first run, ~5GB)
+      - ./backend/models:/app/backend/models
+      # Persist generated music (accessible from host)
+      - ./backend/generated_audio:/app/backend/generated_audio
+      # Persist reference audio uploads
+      - ./backend/ref_audio:/app/backend/ref_audio
+      # Persist database (song history) - uses named volume
+      - heartmula-db:/app/backend/db
+
+    environment:
+      # GPU auto-detection (recommended)
+      - HEARTMULA_4BIT=auto
+      - HEARTMULA_SEQUENTIAL_OFFLOAD=auto
+      # PyTorch memory optimization
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # HuggingFace cache location
+      - HF_HOME=/app/backend/models
+      # Database location (for Docker)
+      - HEARTMULA_DB_PATH=/app/backend/db/jobs.db
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # Model loading takes time
+
+# Named volume for database persistence
+volumes:
+  heartmula-db:

@@ -2,6 +2,7 @@ fastapi>=0.115.2
 uvicorn>=0.27.0
 sqlmodel>=0.0.16
 python-multipart>=0.0.18
+python-dotenv>=1.0.0
 requests>=2.32.2
 aiofiles>=23.2.1
 pydantic>=2.6.1

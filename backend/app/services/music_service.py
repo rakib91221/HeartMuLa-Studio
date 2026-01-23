@@ -43,12 +43,180 @@ MODEL_VERSIONS = {
 # Default version to use - latest RL-tuned model for best quality
 DEFAULT_VERSION = os.environ.get("HEARTMULA_VERSION", "RL-3B-20260123")
 
-# Configuration: Enable 4-bit quantization for lower VRAM usage
-# Set to True to use ~3GB instead of ~11GB for HeartMuLa
-ENABLE_4BIT_QUANTIZATION = os.environ.get("HEARTMULA_4BIT", "false").lower() == "true"
+# Configuration: GPU mode settings
+# These can be set manually via environment variables, or left as "auto" for automatic detection
+# HEARTMULA_4BIT: "true", "false", or "auto" (default: auto)
+# HEARTMULA_SEQUENTIAL_OFFLOAD: "true", "false", or "auto" (default: auto)
+_4BIT_ENV = os.environ.get("HEARTMULA_4BIT", "auto").lower()
+_OFFLOAD_ENV = os.environ.get("HEARTMULA_SEQUENTIAL_OFFLOAD", "auto").lower()
+
+# Manual overrides (if explicitly set to true/false)
+ENABLE_4BIT_QUANTIZATION = _4BIT_ENV == "true" if _4BIT_ENV != "auto" else None
+ENABLE_SEQUENTIAL_OFFLOAD = _OFFLOAD_ENV == "true" if _OFFLOAD_ENV != "auto" else None
+
+# VRAM thresholds for auto-detection (in GB)
+VRAM_THRESHOLD_FULL_PRECISION = 20.0  # Can fit HeartMuLa (~11GB) + HeartCodec (~6GB) + KV cache (~4GB)
+VRAM_THRESHOLD_QUANTIZED_NO_SWAP = 14.0  # Can fit 4-bit HeartMuLa (~3GB) + HeartCodec (~6GB) + KV cache (~4GB)
+VRAM_THRESHOLD_QUANTIZED_WITH_SWAP = 10.0  # Can fit 4-bit HeartMuLa (~3GB) + KV cache (~4GB), then swap for codec
+VRAM_MINIMUM = 8.0  # Absolute minimum to run at all
 
 # Default model cache directory
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+
+
+def detect_optimal_gpu_config() -> dict:
+    """
+    Auto-detect the optimal GPU configuration based on available VRAM.
+
+    Returns a dict with:
+        - use_quantization: bool - whether to use 4-bit quantization
+        - use_sequential_offload: bool - whether to use lazy codec loading with model swapping
+        - num_gpus: int - number of GPUs detected
+        - gpu_info: dict - info about each GPU (name, vram, compute capability)
+        - config_name: str - human-readable name of the selected configuration
+        - warning: str or None - any warnings about the configuration
+    """
+    result = {
+        "use_quantization": True,  # Default to quantization for safety
+        "use_sequential_offload": True,  # Default to sequential for safety
+        "num_gpus": 0,
+        "gpu_info": {},
+        "config_name": "CPU Only",
+        "warning": None,
+    }
+
+    if not torch.cuda.is_available():
+        result["warning"] = "No CUDA GPU detected. Running on CPU will be very slow."
+        return result
+
+    num_gpus = torch.cuda.device_count()
+    result["num_gpus"] = num_gpus
+
+    # Gather GPU info
+    gpu_info = {}
+    total_vram = 0
+    max_vram = 0
+    max_vram_gpu = 0
+    max_compute = 0
+    max_compute_gpu = 0
+
+    for i in range(num_gpus):
+        props = torch.cuda.get_device_properties(i)
+        vram_gb = props.total_memory / (1024 ** 3)
+        compute_cap = props.major + props.minor / 10
+        gpu_info[i] = {
+            "name": props.name,
+            "vram_gb": vram_gb,
+            "compute_capability": compute_cap,
+            "supports_flash_attention": compute_cap >= 7.0,
+        }
+        total_vram += vram_gb
+        if vram_gb > max_vram:
+            max_vram = vram_gb
+            max_vram_gpu = i
+        if compute_cap > max_compute:
+            max_compute = compute_cap
+            max_compute_gpu = i
+
+    result["gpu_info"] = gpu_info
+
+    # Log detected GPUs
+    print(f"\n[Auto-Config] Detected {num_gpus} GPU(s):", flush=True)
+    for i, info in gpu_info.items():
+        fa_status = "✓ Flash Attention" if info["supports_flash_attention"] else "✗ No Flash Attention"
+        print(f"  GPU {i}: {info['name']} ({info['vram_gb']:.1f} GB, SM {info['compute_capability']}) - {fa_status}", flush=True)
+
+    # Decision logic for single GPU
+    if num_gpus == 1:
+        vram = gpu_info[0]["vram_gb"]
+
+        if vram >= VRAM_THRESHOLD_FULL_PRECISION:
+            # 20GB+: Full precision, no swapping needed
+            result["use_quantization"] = False
+            result["use_sequential_offload"] = False
+            result["config_name"] = "Full Precision (Single GPU)"
+            print(f"[Auto-Config] Selected: FULL PRECISION mode ({vram:.1f}GB VRAM >= {VRAM_THRESHOLD_FULL_PRECISION}GB threshold)", flush=True)
+
+        elif vram >= VRAM_THRESHOLD_QUANTIZED_NO_SWAP:
+            # 14-20GB: 4-bit quantization, no swapping needed
+            result["use_quantization"] = True
+            result["use_sequential_offload"] = False
+            result["config_name"] = "4-bit Quantized (Single GPU)"
+            print(f"[Auto-Config] Selected: 4-BIT QUANTIZED mode, no model swapping ({vram:.1f}GB VRAM >= {VRAM_THRESHOLD_QUANTIZED_NO_SWAP}GB threshold)", flush=True)
+
+        elif vram >= VRAM_THRESHOLD_QUANTIZED_WITH_SWAP:
+            # 10-14GB: 4-bit quantization with sequential offload
+            result["use_quantization"] = True
+            result["use_sequential_offload"] = True
+            result["config_name"] = "4-bit Quantized + Sequential Offload (Single GPU)"
+            print(f"[Auto-Config] Selected: 4-BIT QUANTIZED + SEQUENTIAL OFFLOAD mode ({vram:.1f}GB VRAM)", flush=True)
+            print(f"[Auto-Config] Note: Models will be swapped in/out of VRAM. This adds ~70s overhead per song.", flush=True)
+
+        elif vram >= VRAM_MINIMUM:
+            # 8-10GB: Might work with aggressive settings
+            result["use_quantization"] = True
+            result["use_sequential_offload"] = True
+            result["config_name"] = "4-bit Quantized + Sequential Offload (Low VRAM)"
+            result["warning"] = f"Low VRAM ({vram:.1f}GB). Generation may fail or be very slow."
+            print(f"[Auto-Config] WARNING: Low VRAM ({vram:.1f}GB). Using 4-bit + sequential offload but may encounter OOM errors.", flush=True)
+
+        else:
+            # <8GB: Probably won't work
+            result["use_quantization"] = True
+            result["use_sequential_offload"] = True
+            result["config_name"] = "Insufficient VRAM"
+            result["warning"] = f"Insufficient VRAM ({vram:.1f}GB < {VRAM_MINIMUM}GB minimum). Generation will likely fail."
+            print(f"[Auto-Config] ERROR: Insufficient VRAM ({vram:.1f}GB). Minimum {VRAM_MINIMUM}GB required.", flush=True)
+
+    # Decision logic for multi-GPU
+    else:
+        # Multi-GPU: Distribute models across GPUs
+        # HeartMuLa goes to fastest GPU (for Flash Attention)
+        # HeartCodec goes to GPU with most VRAM
+
+        mula_gpu = max_compute_gpu
+        codec_gpu = max_vram_gpu
+
+        # If same GPU is both fastest and largest, put codec on second-best
+        if mula_gpu == codec_gpu:
+            # Find second GPU with most VRAM
+            second_vram = 0
+            for i, info in gpu_info.items():
+                if i != mula_gpu and info["vram_gb"] > second_vram:
+                    second_vram = info["vram_gb"]
+                    codec_gpu = i
+
+        mula_vram = gpu_info[mula_gpu]["vram_gb"]
+        codec_vram = gpu_info[codec_gpu]["vram_gb"]
+
+        # Check if we need quantization for the HeartMuLa GPU
+        if mula_vram >= 16.0:
+            # HeartMuLa GPU has enough VRAM for full precision
+            result["use_quantization"] = False
+            result["config_name"] = f"Full Precision Multi-GPU (HeartMuLa: GPU {mula_gpu}, HeartCodec: GPU {codec_gpu})"
+            print(f"[Auto-Config] Selected: FULL PRECISION MULTI-GPU mode", flush=True)
+        else:
+            # Need quantization for HeartMuLa
+            result["use_quantization"] = True
+            result["config_name"] = f"4-bit Multi-GPU (HeartMuLa: GPU {mula_gpu}, HeartCodec: GPU {codec_gpu})"
+            print(f"[Auto-Config] Selected: 4-BIT MULTI-GPU mode", flush=True)
+
+        # Multi-GPU never needs sequential offload (models on different GPUs)
+        result["use_sequential_offload"] = False
+
+        print(f"[Auto-Config] HeartMuLa -> GPU {mula_gpu}: {gpu_info[mula_gpu]['name']} ({mula_vram:.1f}GB)", flush=True)
+        print(f"[Auto-Config] HeartCodec -> GPU {codec_gpu}: {gpu_info[codec_gpu]['name']} ({codec_vram:.1f}GB)", flush=True)
+
+        # Check if codec GPU has enough VRAM
+        if codec_vram < 8.0:
+            result["warning"] = f"HeartCodec GPU has low VRAM ({codec_vram:.1f}GB). May encounter issues."
+
+    print(f"[Auto-Config] Configuration: {result['config_name']}", flush=True)
+    if result["warning"]:
+        print(f"[Auto-Config] ⚠️  {result['warning']}", flush=True)
+    print("", flush=True)
+
+    return result
 
 
 def ensure_models_downloaded(model_dir: str = DEFAULT_MODEL_DIR, version: str = None) -> str:
@@ -205,10 +373,19 @@ def create_quantized_pipeline(
     version: str,
     mula_device: torch.device,
     codec_device: torch.device,
+    lazy_codec: bool = False,
 ) -> HeartMuLaGenPipeline:
     """
     Create a HeartMuLa pipeline with 4-bit quantization for reduced VRAM usage.
     Uses BitsAndBytes NF4 quantization to reduce model size from ~11GB to ~3GB.
+
+    Args:
+        model_path: Path to model directory
+        version: Model version string
+        mula_device: Device for HeartMuLa model
+        codec_device: Device for HeartCodec model
+        lazy_codec: If True, don't load HeartCodec upfront - load only when needed for decoding.
+                    This allows fitting on 12GB GPUs by never having both models in VRAM.
     """
     from heartlib.pipelines.music_generation import _resolve_paths
 
@@ -234,14 +411,17 @@ def create_quantized_pipeline(
         quantization_config=bnb_config,
     )
 
-    # Load HeartCodec normally (it's smaller, no need for quantization)
-    heartcodec = HeartCodec.from_pretrained(
-        codec_path,
-        device_map=codec_device,
-        dtype=torch.float32,
-    )
-
-    print(f"[Quantization] Models loaded. HeartMuLa VRAM reduced by ~4x.", flush=True)
+    heartcodec = None
+    if not lazy_codec:
+        # Load HeartCodec normally (it's smaller, no need for quantization)
+        heartcodec = HeartCodec.from_pretrained(
+            codec_path,
+            device_map=codec_device,
+            dtype=torch.float32,
+        )
+        print(f"[Quantization] Models loaded. HeartMuLa VRAM reduced by ~4x.", flush=True)
+    else:
+        print(f"[Quantization] HeartMuLa loaded (~3GB). HeartCodec will load lazily for decoding.", flush=True)
 
     # Create pipeline with lazy_load=True to avoid double loading
     # Then inject our pre-loaded quantized models
@@ -260,19 +440,27 @@ def create_quantized_pipeline(
 
     # Inject the pre-loaded quantized models
     pipeline._mula = heartmula
-    pipeline._codec = heartcodec
-    pipeline.lazy_load = False  # Prevent unloading after generation
+    pipeline._codec = heartcodec  # None if lazy_codec=True
+    pipeline.lazy_load = lazy_codec  # Keep lazy mode if codec not loaded
+    pipeline._lazy_codec = lazy_codec  # Track if we need lazy codec loading
+    pipeline._codec_path = codec_path  # Store path for lazy loading
 
     return pipeline
 
 
-def patch_pipeline_with_callback(pipeline: HeartMuLaGenPipeline):
+def patch_pipeline_with_callback(pipeline: HeartMuLaGenPipeline, sequential_offload: bool = False):
     """
     Monkey-patch the HeartMuLa pipeline to support progress callbacks.
     This allows us to report generation progress without modifying upstream heartlib.
 
     We store a custom generate method on the pipeline instance that handles callbacks.
+
+    Args:
+        pipeline: The HeartMuLaGenPipeline to patch
+        sequential_offload: If True, offload HeartMuLa to CPU after generation before loading
+                           HeartCodec. This allows fitting on smaller GPUs like RTX 3060.
     """
+    pipeline._sequential_offload = sequential_offload
 
     def generate_with_callback(inputs, callback=None, **kwargs):
         """Custom generate method that supports progress callback."""
@@ -350,21 +538,67 @@ def patch_pipeline_with_callback(pipeline: HeartMuLaGenPipeline):
                 progress = int((i + 1) / max_audio_frames * 100)
                 callback(progress, f"Generating audio... {i + 1}/{max_audio_frames} frames")
 
-        frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-        pipeline._unload()
+        frames = torch.stack(frames).permute(1, 2, 0).squeeze(0).cpu()  # Move to CPU immediately
 
-        # Postprocess
-        model_outputs = {"frames": frames}
-        frames_for_codec = model_outputs["frames"].to(pipeline.codec_device)
+        # Sequential offload: Move HeartMuLa to CPU before loading HeartCodec
+        # This allows fitting on smaller GPUs (12GB) by never having both models in VRAM
+        if pipeline._sequential_offload:
+            print("[Sequential Offload] Moving HeartMuLa to CPU...", flush=True)
+            pipeline.mula.reset_caches()
+            pipeline._mula.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print(f"[Sequential Offload] VRAM after offload: {torch.cuda.memory_allocated()/1024**3:.2f}GB", flush=True)
+        else:
+            pipeline._unload()
+
+        # Postprocess - load codec and decode
+        if callback is not None:
+            callback(95, "Decoding audio...")
+
+        # Lazy codec loading: Load HeartCodec only when needed (for 12GB GPU mode)
+        lazy_codec = getattr(pipeline, '_lazy_codec', False)
+        if lazy_codec and pipeline._codec is None:
+            print("[Lazy Loading] Loading HeartCodec for decoding...", flush=True)
+            codec_path = getattr(pipeline, '_codec_path', None)
+            if codec_path:
+                pipeline._codec = HeartCodec.from_pretrained(
+                    codec_path,
+                    device_map=pipeline.codec_device,
+                    dtype=torch.float32,
+                )
+                print(f"[Lazy Loading] HeartCodec loaded. VRAM: {torch.cuda.memory_allocated()/1024**3:.2f}GB", flush=True)
+            else:
+                raise RuntimeError("Cannot load HeartCodec: codec_path not available")
+
+        frames_for_codec = frames.to(pipeline.codec_device)
         wav = pipeline.codec.detokenize(frames_for_codec)
-        pipeline._unload()
+
+        # Cleanup codec if using lazy loading (free VRAM for next generation)
+        if lazy_codec:
+            print("[Lazy Loading] Unloading HeartCodec after decoding...", flush=True)
+            del pipeline._codec
+            pipeline._codec = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        if pipeline._sequential_offload:
+            # Move HeartMuLa back to GPU for next generation
+            print("[Sequential Offload] Moving HeartMuLa back to GPU...", flush=True)
+            pipeline._mula.to(pipeline.mula_device)
+        elif not lazy_codec:
+            pipeline._unload()
+
         torchaudio.save(save_path, wav.to(torch.float32).cpu(), 48000)
 
     # Store the custom method on the pipeline instance
     pipeline.generate_with_callback = generate_with_callback
 
     logger.info("[Pipeline] Patched HeartMuLa pipeline with callback support")
-    print("[Pipeline] Patched HeartMuLa pipeline with callback support", flush=True)
+    lazy_codec = getattr(pipeline, '_lazy_codec', False)
+    print(f"[Pipeline] Patched with callback support (sequential_offload={sequential_offload}, lazy_codec={lazy_codec})", flush=True)
     return pipeline
 
 
@@ -411,12 +645,35 @@ class MusicService:
             event_manager.publish("job_queue", {"job_id": str(jid), "position": i + 1, "total": len(self.job_queue)})
 
     def _load_pipeline_multi_gpu(self, model_path: str, version: str):
-        """Load pipeline with multi-GPU support using new dict-based device/dtype API."""
-        num_gpus = torch.cuda.device_count()
-        use_quantization = ENABLE_4BIT_QUANTIZATION and QUANTIZATION_AVAILABLE
+        """Load pipeline with multi-GPU support and automatic VRAM-based configuration."""
+
+        # Auto-detect optimal configuration if not manually specified
+        auto_config = detect_optimal_gpu_config()
+
+        # Use manual override if set, otherwise use auto-detected values
+        if ENABLE_4BIT_QUANTIZATION is not None:
+            use_quantization = ENABLE_4BIT_QUANTIZATION and QUANTIZATION_AVAILABLE
+            print(f"[Config] Using manually set HEARTMULA_4BIT={ENABLE_4BIT_QUANTIZATION}", flush=True)
+        else:
+            use_quantization = auto_config["use_quantization"] and QUANTIZATION_AVAILABLE
+            print(f"[Config] Auto-detected: 4-bit quantization = {use_quantization}", flush=True)
+
+        if ENABLE_SEQUENTIAL_OFFLOAD is not None:
+            use_sequential_offload = ENABLE_SEQUENTIAL_OFFLOAD
+            print(f"[Config] Using manually set HEARTMULA_SEQUENTIAL_OFFLOAD={ENABLE_SEQUENTIAL_OFFLOAD}", flush=True)
+        else:
+            use_sequential_offload = auto_config["use_sequential_offload"]
+            print(f"[Config] Auto-detected: sequential offload = {use_sequential_offload}", flush=True)
+
+        # Store the detected config for reference
+        self.gpu_config = auto_config
+
+        num_gpus = auto_config["num_gpus"]
 
         if use_quantization:
             print(f"[Quantization] 4-bit quantization ENABLED - model will use ~3GB instead of ~11GB", flush=True)
+        else:
+            print(f"[Quantization] 4-bit quantization DISABLED - using full precision (~11GB)", flush=True)
 
         if num_gpus < 2:
             logger.info(f"Found {num_gpus} GPU(s). Using single GPU mode...")
@@ -426,12 +683,46 @@ class MusicService:
             configure_flash_attention_for_gpu(0)
 
             if use_quantization:
-                # With quantization, model fits easily - use GPU for both
-                pipeline = create_quantized_pipeline(
-                    model_path, version,
-                    mula_device=torch.device("cuda"),
-                    codec_device=torch.device("cuda"),
+                if use_sequential_offload:
+                    # 12GB GPU mode: Load only HeartMuLa upfront, lazy load HeartCodec
+                    # This allows: HeartMuLa 4-bit (~3GB) + KV cache (~4GB) = ~7GB during generation
+                    # Then swap: unload HeartMuLa, load HeartCodec (~6GB) for decoding
+                    print("[12GB GPU Mode] Using lazy codec loading for 12GB GPU", flush=True)
+                    pipeline = create_quantized_pipeline(
+                        model_path, version,
+                        mula_device=torch.device("cuda"),
+                        codec_device=torch.device("cuda"),
+                        lazy_codec=True,  # Don't load HeartCodec upfront
+                    )
+                    return patch_pipeline_with_callback(pipeline, sequential_offload=True)
+                else:
+                    # With quantization on larger VRAM GPU, model fits easily - use GPU for both
+                    print("[14GB+ GPU Mode] Both models fit in VRAM without swapping", flush=True)
+                    pipeline = create_quantized_pipeline(
+                        model_path, version,
+                        mula_device=torch.device("cuda"),
+                        codec_device=torch.device("cuda"),
+                        lazy_codec=False,
+                    )
+                    return patch_pipeline_with_callback(pipeline, sequential_offload=False)
+            elif use_sequential_offload:
+                # Sequential offload mode for 12GB GPUs without quantization
+                # Both models on same GPU but loaded/unloaded sequentially
+                print("[Sequential Offload] ENABLED - models will be swapped between GPU and CPU", flush=True)
+                pipeline = HeartMuLaGenPipeline.from_pretrained(
+                    model_path,
+                    device={
+                        "mula": torch.device("cuda"),
+                        "codec": torch.device("cuda"),  # Will be loaded when needed
+                    },
+                    dtype={
+                        "mula": torch.bfloat16,
+                        "codec": torch.float32,
+                    },
+                    version=version,
+                    lazy_load=True,
                 )
+                return patch_pipeline_with_callback(pipeline, sequential_offload=True)
             else:
                 # Without quantization, use lazy loading - codec stays on CPU
                 pipeline = HeartMuLaGenPipeline.from_pretrained(
@@ -447,7 +738,7 @@ class MusicService:
                     version=version,
                     lazy_load=True,
                 )
-            return patch_pipeline_with_callback(pipeline)
+                return patch_pipeline_with_callback(pipeline, sequential_offload=False)
 
         # Multi-GPU setup
         logger.info(f"Found {num_gpus} GPUs:")
@@ -458,17 +749,23 @@ class MusicService:
             compute_cap = props.major + props.minor / 10
             gpu_info[i] = {"mem": mem, "compute": compute_cap, "name": props.name}
             logger.info(f"  GPU {i}: {props.name} ({mem:.1f} GB, SM {props.major}.{props.minor})")
+            print(f"[GPU Setup] GPU {i}: {props.name} ({mem:.1f} GB, SM {props.major}.{props.minor})", flush=True)
 
         if use_quantization:
-            # With quantization: prioritize compute capability (faster GPU)
-            # since the quantized model only needs ~3GB
+            # With 4-bit quantization: HeartMuLa only needs ~3GB
+            # Prioritize compute capability (faster GPU with Flash Attention) for HeartMuLa
+            # Put HeartCodec (~6GB) on the GPU with more VRAM
             mula_gpu = max(gpu_info, key=lambda x: gpu_info[x]["compute"])
-            codec_gpu = min(gpu_info, key=lambda x: gpu_info[x]["compute"])
-            print(f"[GPU Setup] Using fastest GPU for HeartMuLa (4-bit quantization enabled)", flush=True)
+            codec_gpu = max(gpu_info, key=lambda x: gpu_info[x]["mem"])
+            # If same GPU has both best compute and most VRAM, use the other for codec
+            if mula_gpu == codec_gpu and num_gpus > 1:
+                codec_gpu = min(gpu_info, key=lambda x: gpu_info[x]["compute"])
+            print(f"[GPU Setup] 4-bit mode: HeartMuLa on fastest GPU, HeartCodec on largest VRAM GPU", flush=True)
         else:
-            # Without quantization: prioritize VRAM (model needs ~11GB)
+            # Without quantization: HeartMuLa needs ~11GB, prioritize VRAM
             mula_gpu = max(gpu_info, key=lambda x: gpu_info[x]["mem"])
             codec_gpu = min(gpu_info, key=lambda x: gpu_info[x]["mem"])
+            print(f"[GPU Setup] Full precision: HeartMuLa on largest VRAM GPU", flush=True)
 
         print(f"[GPU Setup] HeartMuLa -> GPU {mula_gpu}: {gpu_info[mula_gpu]['name']} ({gpu_info[mula_gpu]['mem']:.1f} GB, SM {gpu_info[mula_gpu]['compute']})", flush=True)
         print(f"[GPU Setup] HeartCodec -> GPU {codec_gpu}: {gpu_info[codec_gpu]['name']} ({gpu_info[codec_gpu]['mem']:.1f} GB)", flush=True)
@@ -497,7 +794,7 @@ class MusicService:
                 },
                 version=version,
             )
-        return patch_pipeline_with_callback(pipeline)
+        return patch_pipeline_with_callback(pipeline, sequential_offload=False)
 
     async def initialize(self, model_path: Optional[str] = None, version: str = None):
         if self.pipeline is not None or self.is_loading:

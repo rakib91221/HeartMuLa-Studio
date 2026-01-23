@@ -22,8 +22,10 @@ from backend.app.models import (
 from backend.app.services.music_service import music_service
 from backend.app.services.llm_service import LLMService
 
-# Database
-sqlite_file_name = "backend/jobs.db"
+# Database - configurable path for Docker support
+sqlite_file_name = os.environ.get("HEARTMULA_DB_PATH", "backend/jobs.db")
+# Ensure directory exists for Docker volume mount
+os.makedirs(os.path.dirname(sqlite_file_name) if os.path.dirname(sqlite_file_name) else ".", exist_ok=True)
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url)
 
@@ -573,6 +575,24 @@ def remove_song_from_playlist(playlist_id: UUID, job_id: UUID):
         session.commit()
 
         return {"status": "removed", "playlist_id": str(playlist_id), "job_id": str(job_id)}
+
+
+# ============== FRONTEND STATIC FILES (Docker Production) ==============
+# Serve frontend static files if the dist folder exists (Docker deployment)
+FRONTEND_DIST = "frontend/dist"
+if os.path.exists(FRONTEND_DIST):
+    # Serve static assets (js, css, images)
+    app.mount("/assets", StaticFiles(directory=f"{FRONTEND_DIST}/assets"), name="frontend_assets")
+
+    # Catch-all route for SPA - must be last
+    @app.get("/{path:path}")
+    async def serve_frontend(path: str):
+        # Check if it's a static file
+        file_path = os.path.join(FRONTEND_DIST, path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Otherwise serve index.html for SPA routing
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
 
 
 if __name__ == "__main__":
