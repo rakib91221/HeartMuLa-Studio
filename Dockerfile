@@ -23,7 +23,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Final Image with Python + CUDA
 # =============================================================================
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
