@@ -38,7 +38,8 @@ export function SettingsModal({
         quantization_4bit: 'auto',
         sequential_offload: 'auto',
         torch_compile: false,
-        torch_compile_mode: 'default'
+        torch_compile_mode: 'default',
+        mmgp_quantization: 'false'
     });
     const [ollamaPreset, setOllamaPreset] = useState('host'); // 'host', 'localhost', 'custom'
     const [customOllamaUrl, setCustomOllamaUrl] = useState('');
@@ -351,6 +352,33 @@ export function SettingsModal({
                                         </select>
                                         <p className={`text-xs mt-1 ${darkMode ? 'text-[#6a6a6a]' : 'text-slate-400'}`}>
                                             Loads one model at a time to reduce VRAM usage. Enable if you see CUBLAS_STATUS_EXECUTION_FAILED errors.
+                                        </p>
+                                    </div>
+
+                                    {/* mmgp INT8 Quantization */}
+                                    <div>
+                                        <div className="flex items-center justify-between">
+                                            <label className={labelClass}>INT8 Quantization (mmgp)</label>
+                                            <button
+                                                onClick={() => {
+                                                    const newValue = settings.mmgp_quantization === 'true' ? 'false' : 'true';
+                                                    setSettings({ ...settings, mmgp_quantization: newValue });
+                                                }}
+                                                className={`relative w-11 h-6 rounded-full transition-colors ${
+                                                    settings.mmgp_quantization === 'true'
+                                                        ? darkMode ? 'bg-[#1DB954]' : 'bg-cyan-500'
+                                                        : darkMode ? 'bg-[#383838]' : 'bg-slate-300'
+                                                }`}
+                                            >
+                                                <span className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${
+                                                    settings.mmgp_quantization === 'true' ? 'translate-x-5' : ''
+                                                }`} />
+                                            </button>
+                                        </div>
+                                        <p className={`text-xs mt-1 ${darkMode ? 'text-[#6a6a6a]' : 'text-slate-400'}`}>
+                                            {settings.mmgp_quantization === 'true'
+                                                ? 'INT8: Lower VRAM usage, ~12% slower generation'
+                                                : 'bf16: Faster generation (recommended for RTX 3060+)'}
                                         </p>
                                     </div>
 

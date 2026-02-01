@@ -1,11 +1,11 @@
 services:
   heartmula:
     # Use pre-built image from GitHub Container Registry (faster)
-    image: ghcr.io/fspecii/heartmula-studio:latest
+    # image: ghcr.io/fspecii/heartmula-studio:latest
     # Or build locally: uncomment the lines below and comment out the image line above
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: heartmula-studio
 
     # GPU access - requires NVIDIA Container Toolkit
@@ -35,6 +35,8 @@ services:
       - heartmula-db:/app/backend/db
 
     environment:
+      # Force single GPU for testing
+      - CUDA_VISIBLE_DEVICES=0
       # GPU auto-detection (recommended)
       - HEARTMULA_4BIT=auto
       - HEARTMULA_SEQUENTIAL_OFFLOAD=auto

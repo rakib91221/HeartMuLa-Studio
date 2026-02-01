@@ -58,17 +58,15 @@ COPY --chown=heartmula:heartmula backend/requirements.txt /app/backend/
 # Layer 1: pip upgrade
 RUN pip3 install --no-cache-dir --upgrade pip
 
-# Layer 2: PyTorch (largest dependency ~800MB)
-RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
-
-# Layer 3: torchvision and torchaudio
-RUN pip3 install --no-cache-dir torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Layer 4: Other requirements
+# Layer 2: Install requirements first (may include incompatible torch version)
 RUN pip3 install --no-cache-dir -r /app/backend/requirements.txt
 
-# Layer 5: bitsandbytes and accelerate
+# Layer 3: bitsandbytes and accelerate
 RUN pip3 install --no-cache-dir bitsandbytes accelerate
+
+# Layer 4: Force PyTorch 2.5+ (required for mmgp profiling with torch.nn.Buffer)
+# This MUST come after requirements.txt to override any older torch versions pulled by dependencies
+RUN pip3 install --no-cache-dir --force-reinstall torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 
 # Copy backend code
 COPY --chown=heartmula:heartmula backend/ /app/backend/

@@ -52,3 +52,6 @@ htmlcov/
 backend/generated_tokens/*
 !backend/generated_tokens/.gitkeep
 .env
+
+# Downloaded models (large files)
+backend/models/

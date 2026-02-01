@@ -124,10 +124,11 @@ class GPUStatusResponse(SQLModel):
 
 
 class GPUSettingsRequest(SQLModel):
-    quantization_4bit: Optional[str] = None  # "auto", "true", "false"
+    quantization_4bit: Optional[str] = None  # "auto", "true", "false" (for BitsAndBytes mode)
     sequential_offload: Optional[str] = None  # "auto", "true", "false"
     torch_compile: Optional[bool] = None
     torch_compile_mode: Optional[str] = None  # "default", "reduce-overhead", "max-autotune"
+    mmgp_quantization: Optional[str] = None  # "true", "false" - mmgp runtime INT8 quantization
 
 
 class GPUSettingsResponse(SQLModel):
@@ -135,6 +136,7 @@ class GPUSettingsResponse(SQLModel):
     sequential_offload: str
     torch_compile: bool
     torch_compile_mode: str
+    mmgp_quantization: str = "false"  # mmgp runtime INT8 quantization
 
 
 class StartupStatusResponse(SQLModel):

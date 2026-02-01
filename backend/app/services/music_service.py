@@ -10,12 +10,30 @@ from typing import Optional, Callable, Union, Dict
 from tqdm import tqdm
 from backend.app.models import GenerationRequest, Job, JobStatus
 from sqlmodel import Session, select
-from heartlib.pipelines.music_generation import HeartMuLaGenPipeline, HeartMuLaGenConfig
-from heartlib.heartmula.modeling_heartmula import HeartMuLa
-from heartlib.heartcodec.modeling_heartcodec import HeartCodec
 from tokenizers import Tokenizer
 
-# Optional: 4-bit quantization support
+# Try mmgp pipeline first (more reliable on 12GB GPUs)
+try:
+    from backend.heartmula import HeartMuLaPipeline
+    from mmgp import offload as mmgp_offload
+    MMGP_AVAILABLE = True
+except ImportError:
+    MMGP_AVAILABLE = False
+
+# Fallback to heartlib pipeline
+try:
+    from heartlib.pipelines.music_generation import HeartMuLaGenPipeline, HeartMuLaGenConfig
+    from heartlib.heartmula.modeling_heartmula import HeartMuLa
+    from heartlib.heartcodec.modeling_heartcodec import HeartCodec
+    HEARTLIB_AVAILABLE = True
+except ImportError:
+    HEARTLIB_AVAILABLE = False
+    HeartMuLaGenPipeline = None
+    HeartMuLaGenConfig = None
+    HeartMuLa = None
+    HeartCodec = None
+
+# Optional: 4-bit quantization support (for heartlib mode)
 try:
     from transformers import BitsAndBytesConfig
     QUANTIZATION_AVAILABLE = True
@@ -47,14 +65,24 @@ DEFAULT_VERSION = os.environ.get("HEARTMULA_VERSION", "RL-3B-20260123")
 
 # Configuration: GPU mode settings
 # These can be set manually via environment variables, or left as "auto" for automatic detection
-# HEARTMULA_4BIT: "true", "false", or "auto" (default: auto)
+# HEARTMULA_USE_MMGP: "true", "false", or "auto" (default: auto) - Use mmgp memory management (recommended for 12GB GPUs)
+# HEARTMULA_4BIT: "true", "false", or "auto" (default: auto) - Only used if mmgp is disabled
 # HEARTMULA_SEQUENTIAL_OFFLOAD: "true", "false", or "auto" (default: auto)
 # HEARTMULA_COMPILE: "true" or "false" (default: false) - Enable torch.compile for ~2x faster inference
 # HEARTMULA_COMPILE_MODE: "default", "reduce-overhead", or "max-autotune" (default: default)
+_MMGP_ENV = os.environ.get("HEARTMULA_USE_MMGP", "auto").lower()
 _4BIT_ENV = os.environ.get("HEARTMULA_4BIT", "auto").lower()
 _OFFLOAD_ENV = os.environ.get("HEARTMULA_SEQUENTIAL_OFFLOAD", "auto").lower()
 _COMPILE_ENV = os.environ.get("HEARTMULA_COMPILE", "false").lower()
 _COMPILE_MODE_ENV = os.environ.get("HEARTMULA_COMPILE_MODE", "default").lower()
+
+# Determine if mmgp should be used
+USE_MMGP = None  # None = auto-detect
+if _MMGP_ENV == "true":
+    USE_MMGP = True
+elif _MMGP_ENV == "false":
+    USE_MMGP = False
+# else: auto - will be determined based on VRAM and availability
 
 # Manual overrides (if explicitly set to true/false)
 ENABLE_4BIT_QUANTIZATION = _4BIT_ENV == "true" if _4BIT_ENV != "auto" else None
@@ -83,16 +111,18 @@ def detect_optimal_gpu_config() -> dict:
     Auto-detect the optimal GPU configuration based on available VRAM.
 
     Returns a dict with:
-        - use_quantization: bool - whether to use 4-bit quantization
+        - use_quantization: bool - whether to use 4-bit quantization (legacy, for heartlib mode)
         - use_sequential_offload: bool - whether to use lazy codec loading with model swapping
+        - use_mmgp: bool - whether mmgp memory management should be used
         - num_gpus: int - number of GPUs detected
         - gpu_info: dict - info about each GPU (name, vram, compute capability)
         - config_name: str - human-readable name of the selected configuration
         - warning: str or None - any warnings about the configuration
     """
     result = {
-        "use_quantization": True,  # Default to quantization for safety
+        "use_quantization": True,  # Legacy: for BitsAndBytes mode
         "use_sequential_offload": True,  # Default to sequential for safety
+        "use_mmgp": MMGP_AVAILABLE,  # Prefer mmgp when available
         "num_gpus": 0,
         "gpu_info": {},
         "config_name": "CPU Only",
@@ -162,27 +192,42 @@ def detect_optimal_gpu_config() -> dict:
             print(f"[Auto-Config] Selected: FULL PRECISION mode ({vram:.1f}GB VRAM >= {VRAM_THRESHOLD_FULL_PRECISION}GB threshold)", flush=True)
 
         elif vram >= VRAM_THRESHOLD_QUANTIZED_NO_SWAP:
-            # 14-20GB: 4-bit quantization, no swapping needed
-            result["use_quantization"] = True
+            # 14-20GB: Can fit both models with mmgp bf16
+            result["use_quantization"] = False
             result["use_sequential_offload"] = False
-            result["config_name"] = "4-bit Quantized (Single GPU)"
-            print(f"[Auto-Config] Selected: 4-BIT QUANTIZED mode, no model swapping ({vram:.1f}GB VRAM >= {VRAM_THRESHOLD_QUANTIZED_NO_SWAP}GB threshold)", flush=True)
+            if MMGP_AVAILABLE:
+                result["config_name"] = "mmgp bf16 (Single GPU)"
+                print(f"[Auto-Config] Selected: MMGP BF16 mode ({vram:.1f}GB VRAM)", flush=True)
+            else:
+                result["config_name"] = "4-bit Quantized (Single GPU)"
+                result["use_quantization"] = True
+                print(f"[Auto-Config] Selected: 4-BIT QUANTIZED mode ({vram:.1f}GB VRAM)", flush=True)
 
         elif vram >= VRAM_THRESHOLD_QUANTIZED_WITH_SWAP:
-            # 10-14GB: 4-bit quantization with sequential offload
-            result["use_quantization"] = True
+            # 10-14GB: Use mmgp with model swapping (bf16, no BitsAndBytes)
+            result["use_quantization"] = True  # Legacy flag
             result["use_sequential_offload"] = True
-            result["config_name"] = "4-bit Quantized + Sequential Offload (Single GPU)"
-            print(f"[Auto-Config] Selected: 4-BIT QUANTIZED + SEQUENTIAL OFFLOAD mode ({vram:.1f}GB VRAM)", flush=True)
-            print(f"[Auto-Config] Note: Models will be swapped in/out of VRAM. This adds ~70s overhead per song.", flush=True)
+            if MMGP_AVAILABLE:
+                result["config_name"] = "mmgp bf16 + Model Swap (Single GPU)"
+                print(f"[Auto-Config] Selected: MMGP BF16 + MODEL SWAP mode ({vram:.1f}GB VRAM)", flush=True)
+                print(f"[Auto-Config] Note: Models swap between transformer/codec phases.", flush=True)
+            else:
+                result["config_name"] = "4-bit Quantized + Sequential Offload (Single GPU)"
+                print(f"[Auto-Config] Selected: 4-BIT QUANTIZED + SEQUENTIAL OFFLOAD mode ({vram:.1f}GB VRAM)", flush=True)
+                print(f"[Auto-Config] Note: Models will be swapped in/out of VRAM.", flush=True)
 
         elif vram >= VRAM_MINIMUM:
-            # 8-10GB: Might work with aggressive settings
+            # 8-10GB: Aggressive mode
             result["use_quantization"] = True
             result["use_sequential_offload"] = True
-            result["config_name"] = "4-bit Quantized + Sequential Offload (Low VRAM)"
-            result["warning"] = f"Low VRAM ({vram:.1f}GB). Generation may fail or be very slow."
-            print(f"[Auto-Config] WARNING: Low VRAM ({vram:.1f}GB). Using 4-bit + sequential offload but may encounter OOM errors.", flush=True)
+            if MMGP_AVAILABLE:
+                result["config_name"] = "mmgp bf16 + Model Swap (Low VRAM)"
+                result["warning"] = f"Low VRAM ({vram:.1f}GB). May encounter OOM errors."
+                print(f"[Auto-Config] WARNING: Low VRAM ({vram:.1f}GB). Using mmgp with aggressive swapping.", flush=True)
+            else:
+                result["config_name"] = "4-bit Quantized + Sequential Offload (Low VRAM)"
+                result["warning"] = f"Low VRAM ({vram:.1f}GB). Generation may fail or be very slow."
+                print(f"[Auto-Config] WARNING: Low VRAM ({vram:.1f}GB). Using 4-bit + sequential offload.", flush=True)
 
         else:
             # <8GB: Probably won't work
@@ -478,6 +523,127 @@ def configure_flash_attention_for_gpu(device_id: int):
             torch.backends.cuda.enable_mem_efficient_sdp(False)
         except Exception:
             pass
+
+
+def create_mmgp_pipeline(
+    model_path: str,
+    version: str,
+    device: torch.device = None,
+    optimization_level: str = "balanced",
+    use_int8_quantization: bool = False,
+):
+    """
+    Create a HeartMuLa pipeline using mmgp memory management.
+    This is more reliable than BitsAndBytes on 12GB GPUs.
+
+    Args:
+        model_path: Path to model directory (where HuggingFace models are downloaded)
+        version: Model version string
+        device: CUDA device (default: cuda:0)
+        optimization_level: mmgp profile ("conservative", "balanced", "aggressive")
+        use_int8_quantization: Enable runtime INT8 quantization (slower but lower VRAM)
+
+    Returns:
+        HeartMuLaPipeline instance with mmgp profiling enabled
+    """
+    if not MMGP_AVAILABLE:
+        raise RuntimeError("mmgp is not available. Install with: pip install mmgp accelerate")
+
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    print(f"[mmgp] Creating pipeline with {optimization_level} optimization...", flush=True)
+
+    # NOTE: Pre-quantized INT8 models are NOT used for now.
+    # When dequantized to bf16/f32 for inference, they're the same size as original models.
+    # Pre-quantization only helps with disk storage, not VRAM. For 12GB GPUs, we still need
+    # model swapping. Runtime INT8 quantization (quantizeTransformer=True) is an option
+    # but is slower due to dequantization overhead on every forward pass.
+    use_prequantized = False
+
+    if use_prequantized:
+        # This path is disabled - pre-quantized models don't save VRAM
+        quantized_dir = os.path.join(model_path, "quantized")
+        heartmula_weights_path = os.path.join(quantized_dir, "heartmula_int8.safetensors")
+        print(f"[mmgp] Found pre-quantized INT8 models - using fast mode (no swapping)", flush=True)
+    else:
+        # Find the model weights path from HuggingFace download structure
+        # The downloaded model is typically in a versioned folder like HeartMuLa-oss-RL-3B-20260123
+        model_dir = os.path.join(model_path, f"HeartMuLa-oss-{version}")
+        if not os.path.exists(model_dir):
+            # Try without "oss" prefix
+            model_dir = os.path.join(model_path, f"HeartMuLa-{version}")
+        if not os.path.exists(model_dir):
+            # Check for any HeartMuLa directory with the version suffix
+            import glob
+            candidates = glob.glob(os.path.join(model_path, f"*{version}*"))
+            if candidates:
+                model_dir = candidates[0]
+
+        # Find the model weights (could be sharded or single file)
+        # For sharded models, mmgp expects the first shard file, not the index.json
+        import glob
+        weights_single = os.path.join(model_dir, "model.safetensors")
+        weights_shards = sorted(glob.glob(os.path.join(model_dir, "model-*.safetensors")))
+
+        if weights_shards:
+            # Sharded weights - pass the first shard to mmgp (it will find the others)
+            heartmula_weights_path = weights_shards[0]
+            print(f"[mmgp] Found sharded model weights ({len(weights_shards)} shards), using {heartmula_weights_path}", flush=True)
+        elif os.path.exists(weights_single):
+            heartmula_weights_path = weights_single
+            print(f"[mmgp] Found single model weights at {weights_single}", flush=True)
+        else:
+            raise FileNotFoundError(f"Could not find HeartMuLa model weights in {model_dir}")
+
+    # Create the pipeline with explicit weights path
+    pipeline = HeartMuLaPipeline(
+        ckpt_root=model_path,
+        device=device,
+        version=version,
+        heartmula_weights_path=heartmula_weights_path,
+    )
+
+    # Set up mmgp profiling for memory management
+    try:
+        pipe_config = pipeline.get_mmgp_pipe_config(optimization_level)
+
+        if use_prequantized:
+            # Pre-quantized models fit in 12GB - use fast profile with no swapping
+            profile_no = 1  # HighRAM_HighVRAM_Fastest
+            pipeline._enable_async_codec_load = True  # Can preload codec
+            # Allow models to coexist (both fit in VRAM)
+            pipe_config["coTenantsMap"] = {
+                "transformer": ["transformer2", "codec"],
+                "transformer2": ["transformer", "codec"],
+                "codec": ["transformer", "transformer2"],
+            }
+            print(f"[mmgp] Pre-quantized mode: both models fit in VRAM (no swapping)", flush=True)
+        else:
+            # bf16 models need swapping on 12GB
+            profile_no = {"conservative": 1, "balanced": 3, "aggressive": 5}.get(optimization_level, 3)
+            pipeline._enable_async_codec_load = False  # Can't preload - OOM
+
+        print(f"[mmgp] Setting up profile {profile_no} for memory management...", flush=True)
+
+        offload_obj = mmgp_offload.profile(
+            pipe_config["pipe"],
+            profile_no=profile_no,
+            coTenantsMap=pipe_config.get("coTenantsMap"),
+            budgets=pipe_config.get("budgets"),
+            verboseLevel=0,
+            # Runtime INT8 quantization: configurable via settings
+            # bf16 is ~12% faster, but INT8 uses less VRAM
+            quantizeTransformer=use_int8_quantization,
+        )
+
+        pipeline.set_offload_obj(offload_obj)
+        print(f"[mmgp] Profiling enabled (profile {profile_no})", flush=True)
+
+    except Exception as e:
+        print(f"[mmgp] Warning: Profiling failed: {e}. Continuing without mmgp optimization.", flush=True)
+
+    return pipeline
 
 
 def create_quantized_pipeline(
@@ -776,12 +942,18 @@ class MusicService:
             cls._instance.startup_error = None
             # torch.compile first run tracking
             cls._instance._torch_compile_first_run = True
+            # CUDA error recovery flag
+            cls._instance._cuda_error_occurred = False
+            # mmgp mode flag (set when pipeline is loaded)
+            cls._instance._using_mmgp = False
             # Current settings (for display in settings panel)
             cls._instance.current_settings = {
                 "quantization_4bit": "auto",
                 "sequential_offload": "auto",
                 "torch_compile": False,
                 "torch_compile_mode": "default",
+                # mmgp-specific settings
+                "mmgp_quantization": "false",  # "true" for INT8, "false" for bf16 (faster)
                 # LLM Provider settings
                 "ollama_host": "",
                 "openrouter_api_key": "",
@@ -1154,6 +1326,61 @@ class MusicService:
 
         # Auto-detect optimal configuration if not manually specified
         auto_config = detect_optimal_gpu_config()
+        num_gpus = auto_config["num_gpus"]
+
+        # Check if mmgp should be used (preferred for single GPU 12GB setups)
+        use_mmgp = USE_MMGP
+        if use_mmgp is None:
+            # Auto-detect: use mmgp for single GPU with < 20GB VRAM when available
+            if MMGP_AVAILABLE and num_gpus == 1:
+                gpu_info = auto_config.get("gpu_info", {})
+                if gpu_info:
+                    vram = list(gpu_info.values())[0].get("vram_gb", 0)
+                    use_mmgp = vram < 20  # Use mmgp for < 20GB GPUs
+                else:
+                    use_mmgp = True  # Default to mmgp for single GPU
+            else:
+                use_mmgp = False
+
+        if use_mmgp and MMGP_AVAILABLE:
+            print(f"[Config] Using mmgp memory management (recommended for this GPU)", flush=True)
+            self.gpu_mode = "mmgp"
+            self.gpu_config = auto_config
+
+            # Configure Flash Attention
+            configure_flash_attention_for_gpu(0)
+
+            # Determine optimization level based on VRAM
+            gpu_info = auto_config.get("gpu_info", {})
+            vram = list(gpu_info.values())[0].get("vram_gb", 12) if gpu_info else 12
+
+            if vram < 10:
+                opt_level = "conservative"
+            elif vram < 16:
+                opt_level = "balanced"
+            else:
+                opt_level = "aggressive"
+
+            # Check if INT8 quantization is enabled in settings
+            use_int8 = self.current_settings.get("mmgp_quantization", "false") == "true"
+            if use_int8:
+                print(f"[mmgp] INT8 quantization ENABLED (from settings)", flush=True)
+            else:
+                print(f"[mmgp] Using bf16 precision (faster)", flush=True)
+
+            pipeline = create_mmgp_pipeline(
+                model_path, version,
+                device=torch.device("cuda:0"),
+                optimization_level=opt_level,
+                use_int8_quantization=use_int8,
+            )
+
+            # Store that we're using mmgp mode
+            self._using_mmgp = True
+            return pipeline
+
+        # Fall back to heartlib/BitsAndBytes mode
+        self._using_mmgp = False
 
         # Use manual override if set, otherwise use auto-detected values
         if ENABLE_4BIT_QUANTIZATION is not None:
@@ -1180,8 +1407,6 @@ class MusicService:
 
         # Store the detected config for reference
         self.gpu_config = auto_config
-
-        num_gpus = auto_config["num_gpus"]
 
         if use_quantization:
             print(f"[Quantization] 4-bit quantization ENABLED - model will use ~3GB instead of ~11GB", flush=True)
@@ -1384,6 +1609,31 @@ class MusicService:
 
             logger.info(f"Starting generation for job {job_id_str}")
 
+            # Check for CUDA error recovery
+            if getattr(self, '_cuda_error_occurred', False):
+                logger.info("[CUDA Recovery] Previous CUDA error detected. Reloading models...")
+                print("[CUDA Recovery] Reloading models after previous CUDA error...", flush=True)
+                event_manager.publish("job_progress", {"job_id": job_id_str, "progress": 0, "msg": "Recovering from GPU error..."})
+                try:
+                    self._unload_all_models()
+                    # Reset CUDA context
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        # Reset all GPU devices
+                        for i in range(torch.cuda.device_count()):
+                            with torch.cuda.device(i):
+                                torch.cuda.reset_peak_memory_stats()
+                    # Reload models
+                    await self.initialize_with_progress()
+                    self._cuda_error_occurred = False
+                    logger.info("[CUDA Recovery] Models reloaded successfully")
+                    print("[CUDA Recovery] Models reloaded successfully", flush=True)
+                except Exception as recovery_err:
+                    logger.error(f"[CUDA Recovery] Failed to recover: {recovery_err}")
+                    print(f"[CUDA Recovery] Failed to recover: {recovery_err}", flush=True)
+                    # Continue anyway - the next generation might still work
+
             # 2. Update status to PROCESSING
             import time
             generation_start_time = time.time()
@@ -1540,31 +1790,103 @@ class MusicService:
                                 break
 
                     with torch.no_grad():
-                        pipeline_inputs = {
-                            "lyrics": request.lyrics or "",  # heartlib expects string, not None
-                            "tags": sound_tags,
-                        }
-                        if ref_audio_path:
-                            pipeline_inputs["ref_audio"] = ref_audio_path
-                            pipeline_inputs["muq_segment_sec"] = muq_segment_sec
-                            if request.ref_audio_start_sec is not None:
-                                pipeline_inputs["ref_audio_start_sec"] = request.ref_audio_start_sec
+                        # Check if using mmgp pipeline (different interface)
+                        if getattr(self, '_using_mmgp', False):
+                            # mmgp pipeline has different interface:
+                            # - input_prompt = lyrics
+                            # - alt_prompt = tags
+                            # - Returns dict with 'x' (audio tensor) and 'audio_sampling_rate'
+                            print(f"[mmgp] Generating with mmgp pipeline...", flush=True)
+
+                            lyrics_text = request.lyrics or ""
+                            if not lyrics_text.strip():
+                                # For instrumental mode, use "[instrumental]" as lyrics
+                                lyrics_text = "[instrumental]"
+
+                            if ref_audio_path:
+                                print(f"[mmgp] Warning: Reference audio not yet supported in mmgp mode", flush=True)
+
+                            # Adapter callback: mmgp uses step_idx/override_num_inference_steps
+                            # but our callback expects (progress, msg)
+                            def _mmgp_callback_adapter(step_idx=-1, override_num_inference_steps=None, force_refresh=False, **kwargs):
+                                if override_num_inference_steps and override_num_inference_steps > 0:
+                                    if step_idx >= 0:
+                                        progress = int((step_idx + 1) / override_num_inference_steps * 100)
+                                        generated_sec = step_idx + 1
+                                        msg = f"Generating... {generated_sec}s / {override_num_inference_steps}s"
+                                    else:
+                                        progress = 0
+                                        msg = "Starting generation..."
+                                elif force_refresh:
+                                    progress = 95
+                                    msg = "Decoding audio..."
+                                else:
+                                    progress = 0
+                                    msg = "Processing..."
+                                _pipeline_callback(progress, msg)
+
+                            result = self.pipeline.generate(
+                                input_prompt=lyrics_text,
+                                model_mode=None,  # Not used
+                                audio_guide=None,  # Reference audio not supported yet
+                                alt_prompt=sound_tags,
+                                temperature=request.temperature,
+                                max_audio_length_ms=request.duration_ms,
+                                topk=request.topk,
+                                cfg_scale=request.cfg_scale,
+                                seed=seed_to_use,
+                                callback=_mmgp_callback_adapter,
+                            )
+
+                            if result is not None and "x" in result:
+                                # Save the audio tensor to file
+                                wav = result["x"]
+                                sample_rate = result.get("audio_sampling_rate", 48000)
+
+                                # Ensure tensor is on CPU and in correct format
+                                if isinstance(wav, torch.Tensor):
+                                    wav = wav.cpu()
+                                    if wav.dim() == 1:
+                                        wav = wav.unsqueeze(0)  # Add channel dimension
+
+                                # Save using torchaudio (preferred) or soundfile
+                                try:
+                                    torchaudio.save(save_path, wav, sample_rate)
+                                except Exception as e:
+                                    print(f"[mmgp] torchaudio save failed: {e}, trying soundfile...", flush=True)
+                                    import soundfile as sf
+                                    sf.write(save_path, wav.squeeze().numpy(), sample_rate)
+
+                                print(f"[mmgp] Audio saved to {save_path}", flush=True)
+                            else:
+                                raise RuntimeError("mmgp pipeline returned no audio output")
                         else:
-                            print(f"[DEBUG] No ref_audio_path found", flush=True)
+                            # Original heartlib pipeline interface
+                            pipeline_inputs = {
+                                "lyrics": request.lyrics or "",  # heartlib expects string, not None
+                                "tags": sound_tags,
+                            }
+                            if ref_audio_path:
+                                pipeline_inputs["ref_audio"] = ref_audio_path
+                                pipeline_inputs["muq_segment_sec"] = muq_segment_sec
+                                if request.ref_audio_start_sec is not None:
+                                    pipeline_inputs["ref_audio_start_sec"] = request.ref_audio_start_sec
+                            else:
+                                print(f"[DEBUG] No ref_audio_path found", flush=True)
 
-                        if request.negative_tags:
-                            pipeline_inputs["negative_tags"] = request.negative_tags
-                            print(f"[DEBUG] Using negative_tags: {request.negative_tags}", flush=True)
+                            if request.negative_tags:
+                                pipeline_inputs["negative_tags"] = request.negative_tags
+                                print(f"[DEBUG] Using negative_tags: {request.negative_tags}", flush=True)
 
-                        self.pipeline.generate_with_callback(
-                            pipeline_inputs,
-                            max_audio_length_ms=request.duration_ms,
-                            save_path=save_path,
-                            topk=request.topk,
-                            temperature=request.temperature,
-                            cfg_scale=request.cfg_scale,
-                            callback=_pipeline_callback,
-                        )
+                            self.pipeline.generate_with_callback(
+                                pipeline_inputs,
+                                max_audio_length_ms=request.duration_ms,
+                                save_path=save_path,
+                                topk=request.topk,
+                                temperature=request.temperature,
+                                cfg_scale=request.cfg_scale,
+                                callback=_pipeline_callback,
+                            )
 
                     return None
 

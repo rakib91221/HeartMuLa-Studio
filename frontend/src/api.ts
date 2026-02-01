@@ -72,6 +72,7 @@ export interface GPUSettings {
     sequential_offload: string;
     torch_compile: boolean;
     torch_compile_mode: string;
+    mmgp_quantization: string;  // "true" for INT8, "false" for bf16
 }
 
 export interface LLMSettings {
