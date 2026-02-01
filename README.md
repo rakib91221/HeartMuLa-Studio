@@ -90,13 +90,23 @@
 
 ## Performance Optimizations
 
-HeartMuLa Studio includes several optimizations for faster generation and lower VRAM usage:
+HeartMuLa Studio uses **mmgp (Memory Management for GPU Poor)** for intelligent GPU memory management, enabling reliable generation on GPUs with 10GB+ VRAM.
 
-### 🚀 4-bit Quantization
-Reduces VRAM usage from **~11GB to ~3GB** using BitsAndBytes NF4 quantization:
-```bash
-HEARTMULA_4BIT=true python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-```
+### 🧠 mmgp Memory Management
+
+mmgp provides lazy model loading with automatic memory swapping between the transformer and codec models. This is more reliable than traditional quantization methods, especially on newer GPUs.
+
+| Feature | Description |
+|---------|-------------|
+| **bf16 Precision** | Default mode, fastest performance |
+| **Model Swapping** | Automatically swaps models when VRAM is limited |
+| **INT8 Quantization** | Optional, ~12% slower but lower peak VRAM |
+
+**Performance on RTX 3060 12GB (bf16 + Model Swap):**
+| Duration | Generation Time | Real-Time Factor |
+|----------|-----------------|------------------|
+| 30 seconds | ~48 seconds | 1.60x |
+| 60 seconds | ~80 seconds | 1.33x |
 
 ### ⚡ Flash Attention
 Automatically configured based on your GPU:
@@ -132,9 +142,8 @@ HEARTMULA_COMPILE=true HEARTMULA_COMPILE_MODE=max-autotune python -m uvicorn bac
 
 ### 🎯 Smart Multi-GPU Detection
 Automatically selects the best GPU configuration:
-- **With 4-bit quantization**: Prioritizes fastest GPU (highest compute capability)
-- **Without quantization**: Prioritizes GPU with most VRAM
-- HeartMuLa → Primary GPU, HeartCodec → Secondary GPU
+- **Single GPU**: Uses mmgp with model swapping based on available VRAM
+- **Multi-GPU**: HeartMuLa → fastest GPU (Flash Attention), HeartCodec → largest VRAM GPU
 
 ### 📥 Auto-Download
 Models are automatically downloaded from HuggingFace Hub on first run (~5GB):
@@ -152,13 +161,51 @@ That's it! The system auto-detects your GPU and downloads models on first run.
 
 Open http://localhost:5173
 
+## Settings Modal
+
+Click the **gear icon** (⚙️) in the header to open the Settings Modal. This provides a user-friendly way to configure GPU settings without editing files.
+
+### GPU Hardware Info
+
+The Settings Modal displays your detected GPU(s) with:
+- GPU name and VRAM
+- Flash Attention support status
+- Current configuration mode
+
+### Configuration Options
+
+| Setting | Options | Description |
+|---------|---------|-------------|
+| **INT8 Quantization** | On/Off | Enable mmgp INT8 quantization (slower but lower peak VRAM) |
+| **Memory Swap Mode** | Auto/On/Off | Model swapping for limited VRAM GPUs |
+| **torch.compile** | On/Off | PyTorch compilation for faster inference |
+
+### Recommended Settings by GPU
+
+| GPU | VRAM | Recommended Settings |
+|-----|------|---------------------|
+| **RTX 4090** | 24GB | All defaults (Full Precision) |
+| **RTX 3090** | 24GB | All defaults (Full Precision) |
+| **RTX 4070 Ti** | 16GB | All defaults (mmgp bf16) |
+| **RTX 3060** | 12GB | Memory Swap: On, INT8: Off (bf16 is faster) |
+| **RTX 4060** | 8GB | Memory Swap: On, may need INT8: On |
+
+### Applying Changes
+
+1. Adjust settings in the modal
+2. Click **"Apply & Reload Models"**
+3. Wait for model reload (~30-60 seconds)
+4. New settings take effect for all future generations
+
+> **Note:** Settings are saved to `backend/settings.json` and persist across restarts.
+
 ## Docker (Recommended)
 
 The easiest way to run HeartMuLa Studio - no Python/Node setup required.
 
 ### Prerequisites
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-- NVIDIA GPU with 10GB+ VRAM
+- NVIDIA GPU with **10GB+ VRAM** (12GB recommended for reliable generation)
 
 ### Quick Start with Docker
 
@@ -240,13 +287,15 @@ Override settings in `docker-compose.yml`:
 
 ```yaml
 environment:
-  - HEARTMULA_4BIT=true                  # Force 4-bit quantization
-  - HEARTMULA_SEQUENTIAL_OFFLOAD=true    # Force model swapping (low VRAM)
+  - HEARTMULA_SEQUENTIAL_OFFLOAD=true    # Force Memory Swap Mode (for limited VRAM)
+  - HEARTMULA_COMPILE=true               # Enable torch.compile
 
 volumes:
   # Use existing models from another location (e.g., ComfyUI)
   - /path/to/comfyui/models/heartmula:/app/backend/models
 ```
+
+> **Tip:** Use the Settings Modal in the UI to change settings instead of editing docker-compose.yml. Settings persist in `backend/settings.json`.
 
 ### Using Ollama with Docker
 
@@ -266,7 +315,7 @@ environment:
 
 - **Python** 3.10 or higher
 - **Node.js** 18 or higher
-- **CUDA GPU** with 10GB+ VRAM
+- **NVIDIA GPU** with **10GB+ VRAM** (12GB+ recommended)
 - **Git** for cloning the repository
 
 ## Installation
@@ -357,12 +406,13 @@ OLLAMA_HOST=http://localhost:11434
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HEARTMULA_MODEL_DIR` | `backend/models` | Custom model directory (share with ComfyUI, etc.) |
-| `HEARTMULA_4BIT` | `auto` | 4-bit quantization: `auto`, `true`, or `false` |
-| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto` | Model swapping for low VRAM: `auto`, `true`, or `false` |
+| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto` | Memory Swap Mode: `auto`, `true`, or `false` |
 | `HEARTMULA_COMPILE` | `false` | torch.compile for ~2x faster inference: `true` or `false` |
 | `HEARTMULA_COMPILE_MODE` | `default` | Compile mode: `default`, `reduce-overhead`, or `max-autotune` |
 | `HEARTMULA_VERSION` | `RL-3B-20260123` | Model version (latest RL-tuned model) |
 | `CUDA_VISIBLE_DEVICES` | all GPUs | Specify which GPUs to use (e.g., `0,1`) |
+
+> **Tip:** Most settings can now be changed via the Settings Modal in the UI without restarting.
 
 **Example: Use existing models from ComfyUI:**
 ```bash
@@ -371,23 +421,25 @@ HEARTMULA_MODEL_DIR=/path/to/comfyui/models/heartmula ./start.sh
 
 ### GPU Auto-Configuration
 
-HeartMuLa Studio **automatically detects** your GPU VRAM and selects the optimal configuration:
+HeartMuLa Studio **automatically detects** your available VRAM (not just total, accounting for other apps) and selects the optimal configuration:
 
-| Your VRAM | Auto-Selected Mode | Speed | Example GPUs |
-|-----------|-------------------|-------|--------------|
-| **20GB+** | Full Precision | ~7 fps | RTX 4090, RTX 3090 Ti, A6000 |
-| **14-20GB** | 4-bit Quantized | ~7 fps | RTX 4060 Ti 16GB, RTX 3090 |
-| **10-14GB** | 4-bit + Model Swap | ~4 fps (+70s/song) | RTX 3060 12GB, RTX 4060 8GB |
-| **<10GB** | Not supported | - | Insufficient VRAM |
+| Available VRAM | Auto-Selected Mode | Performance | Example GPUs |
+|----------------|-------------------|-------------|--------------|
+| **20GB+** | Full Precision | Fastest | RTX 4090, RTX 3090 Ti, A6000 |
+| **14-20GB** | mmgp bf16 | Fast | RTX 4060 Ti 16GB, RTX 3090 |
+| **10-14GB** | mmgp bf16 + Model Swap | ~1.3-1.6x RTF | RTX 3060 12GB, RTX 4080 12GB |
+| **8-10GB** | mmgp bf16 + Model Swap (Low VRAM) | May have issues | RTX 3070, RTX 4060 8GB |
+| **<8GB** | Not supported | - | Insufficient VRAM |
 
-**Multi-GPU:** Automatically detected and used. HeartMuLa goes to fastest GPU (Flash Attention), HeartCodec to largest VRAM GPU.
+> **RTF = Real-Time Factor** (e.g., 1.3x means 60s of audio takes ~80s to generate)
+
+**Multi-GPU:** Automatically detected. HeartMuLa goes to fastest GPU (Flash Attention), HeartCodec to largest VRAM GPU.
 
 ### Start Options
 
 ```bash
 ./start.sh                # Auto-detect (recommended)
-./start.sh --force-4bit   # Force 4-bit quantization
-./start.sh --force-swap   # Force model swapping (low VRAM mode)
+./start.sh --force-swap   # Force Memory Swap Mode (low VRAM mode)
 ./start.sh --help         # Show all options
 ```
 
@@ -396,23 +448,24 @@ HeartMuLa Studio **automatically detects** your GPU VRAM and selects the optimal
 Override auto-detection with environment variables:
 
 ```bash
-# Force specific settings
-HEARTMULA_4BIT=true HEARTMULA_SEQUENTIAL_OFFLOAD=false ./start.sh
+# Force Memory Swap Mode
+HEARTMULA_SEQUENTIAL_OFFLOAD=true ./start.sh
 
 # Or run directly
-HEARTMULA_4BIT=true python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
 | Variable | Values | Description |
 |----------|--------|-------------|
-| `HEARTMULA_4BIT` | `auto`, `true`, `false` | 4-bit quantization (default: auto) |
-| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto`, `true`, `false` | Model swapping for low VRAM (default: auto) |
+| `HEARTMULA_SEQUENTIAL_OFFLOAD` | `auto`, `true`, `false` | Memory Swap Mode (default: auto) |
 | `CUDA_VISIBLE_DEVICES` | `0`, `0,1`, etc. | Select specific GPUs |
 
 **Memory Optimization:**
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
+
+> **Recommended:** Use the Settings Modal in the UI for most configuration changes. It provides a visual interface and saves settings persistently.
 
 ### LLM Setup (Optional)
 
@@ -478,12 +531,14 @@ HeartMuLa-Studio/
 
 | Issue | Solution |
 |-------|----------|
-| CUDA out of memory | System should auto-detect. Try `./start.sh --force-swap` or reduce duration |
+| CUDA out of memory | Enable Memory Swap Mode in Settings Modal, or try `./start.sh --force-swap` |
+| CUDA device-side assert | Update to latest version (fixed in mmgp integration) |
 | Models not downloading | Check internet connection and disk space (~5GB needed in `backend/models/`) |
 | Frontend can't connect | Ensure backend is running on port 8000 |
 | LLM not working | Check Ollama is running or OpenRouter API key is set in `backend/.env` |
 | Only one GPU detected | Set `CUDA_VISIBLE_DEVICES=0,1` explicitly when starting backend |
-| Slow generation | Check logs: `tail -f /tmp/heartmula_backend.log` for GPU config |
+| Slow generation | Check Settings Modal for GPU config; bf16 is faster than INT8 |
+| Settings not saving | Check write permissions on `backend/settings.json` |
 
 ### Models Location
 
