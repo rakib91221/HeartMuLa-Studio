@@ -631,30 +631,34 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
                         </AnimatePresence>
                     </div>
 
-                    {/* Duration Quick Select */}
+                    {/* Duration Slider */}
                     <div className="space-y-1.5">
-                        <label className={`text-xs font-medium flex items-center gap-1.5 ${darkMode ? 'text-[#b3b3b3]' : 'text-slate-600'}`}>
-                            <Clock className="w-3 h-3" />
-                            Duration: {duration}s
-                        </label>
-                        <div className="flex gap-2">
-                            {[30, 60, 120, 180].map(d => (
-                                <button
-                                    key={d}
-                                    onClick={() => setDuration(d)}
-                                    className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${
-                                        duration === d
-                                            ? darkMode
-                                                ? 'bg-[#1DB954] text-black font-medium'
-                                                : 'bg-cyan-500 text-white font-medium'
-                                            : darkMode
-                                                ? 'bg-[#282828] text-[#b3b3b3] hover:bg-[#383838]'
-                                                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                                    }`}
-                                >
-                                    {d}s
-                                </button>
-                            ))}
+                        <div className="flex justify-between items-center">
+                            <label className={`text-xs font-medium flex items-center gap-1.5 ${darkMode ? 'text-[#b3b3b3]' : 'text-slate-600'}`}>
+                                <Clock className="w-3 h-3" />
+                                Duration
+                            </label>
+                            <span className={`text-xs font-mono ${darkMode ? 'text-[#1DB954]' : 'text-cyan-600'}`}>
+                                {duration >= 60 ? `${Math.floor(duration / 60)}m${duration % 60 ? ` ${duration % 60}s` : ''}` : `${duration}s`}
+                            </span>
+                        </div>
+                        <input
+                            type="range"
+                            min="30"
+                            max="240"
+                            step="10"
+                            value={duration}
+                            onChange={(e) => setDuration(parseInt(e.target.value))}
+                            className="w-full h-1.5 rounded-full appearance-none cursor-pointer accent-[#1DB954]"
+                            style={{
+                                background: darkMode
+                                    ? `linear-gradient(to right, #1DB954 0%, #1DB954 ${((duration - 30) / 210) * 100}%, #404040 ${((duration - 30) / 210) * 100}%, #404040 100%)`
+                                    : `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${((duration - 30) / 210) * 100}%, #e2e8f0 ${((duration - 30) / 210) * 100}%, #e2e8f0 100%)`
+                            }}
+                        />
+                        <div className={`flex justify-between text-[9px] ${darkMode ? 'text-[#606060]' : 'text-slate-400'}`}>
+                            <span>30s</span>
+                            <span>4m</span>
                         </div>
                     </div>
 
