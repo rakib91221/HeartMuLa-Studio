@@ -900,6 +900,7 @@ class HeartMuLaPipeline:
             target_device = torch.device("cuda")
 
         model_inputs = self._move_model_inputs(model_inputs, target_device)
+        self._move_embeddings_to_device(target_device)
 
         # Async codec preloading - DISABLED by default for 12GB GPUs
         # On 12GB VRAM, this causes OOM because transformer (~7GB) and codec (~6GB)
